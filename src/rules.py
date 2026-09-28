@@ -1,13 +1,19 @@
 """跨海光缆故障与抢修协调领域规则与状态转换。"""
-from typing import Any, Dict, Iterable, Tuple
+from typing import Any, Dict, Iterable, List, Tuple
 
 from .domain import Actor, Conflict, ValidationError, boolean, choice, integer, number, text, text_list
 
 
 INITIAL_STATE = "detected"
+RESTORING_STATE = "restoring"
 CREATE_ROLES = {'noc_operator'}
-ACTION_ROLES = {'approve': {'repair_manager'}, 'mobilize': {'vessel_master'}, 'survey': {'cable_engineer'}, 'splice': {'cable_engineer'}, 'test': {'noc_operator'}, 'restore': {'noc_operator', 'repair_manager'}, 'cancel': {'repair_manager'}}
-TRANSITIONS = {'approve': {'detected': 'approved'}, 'mobilize': {'approved': 'mobilized'}, 'survey': {'mobilized': 'surveyed'}, 'splice': {'surveyed': 'spliced'}, 'test': {'spliced': 'tested'}, 'restore': {'tested': 'restored'}, 'cancel': {'detected': 'cancelled', 'approved': 'cancelled', 'mobilized': 'cancelled'}}
+ACTION_ROLES = {'approve': {'repair_manager'}, 'mobilize': {'vessel_master'}, 'survey': {'cable_engineer'}, 'splice': {'cable_engineer'}, 'test': {'noc_operator'}, 'register_batch': {'noc_operator', 'repair_manager'}, 'confirm_batch': {'noc_operator', 'repair_manager'}, 'revert_batch': {'noc_operator', 'repair_manager'}, 'restore': {'noc_operator', 'repair_manager'}, 'cancel': {'repair_manager'}}
+TRANSITIONS = {'approve': {'detected': 'approved'}, 'mobilize': {'approved': 'mobilized'}, 'survey': {'mobilized': 'surveyed'}, 'splice': {'surveyed': 'spliced'}, 'test': {'spliced': 'tested'}, 'register_batch': {'tested': 'restoring', 'restoring': 'restoring'}, 'confirm_batch': {'restoring': 'restoring'}, 'revert_batch': {'restoring': 'restoring'}, 'restore': {'restoring': 'restored'}, 'cancel': {'detected': 'cancelled', 'approved': 'cancelled', 'mobilized': 'cancelled'}}
+
+BATCH_PENDING = "pending"
+BATCH_CONFIRMED = "confirmed"
+BATCH_REVERTED = "reverted"
+LEDGER_ACTIONS = {'register_batch', 'confirm_batch', 'revert_batch'}
 
 
 class DomainRules:
@@ -106,14 +112,78 @@ class DomainRules:
             changes["end_to_end_loss_db"] = end_loss
             changes["test_passed"] = True
             summary = "系统测试通过"
-        elif action == "restore":
-            if not boolean(data, "traffic_restored"):
-                raise ValidationError("业务流量尚未恢复")
-            changes["traffic_restored"] = True
-            changes["restore_capacity_gbps"] = integer(data, "restore_capacity_gbps", 1)
-            summary = "通信恢复"
         elif action == "cancel":
             changes["cancel_reason"] = text(data, "cancel_reason")
             summary = "抢修取消"
         p.update(changes)
         return new_state, p, summary or ("已执行%s" % action)
+
+    @staticmethod
+    def _active_batches(batches: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        return [batch for batch in batches if batch["status"] != BATCH_REVERTED]
+
+    @staticmethod
+    def _find_batch(batches: List[Dict[str, Any]], seq: int) -> Dict[str, Any]:
+        for batch in batches:
+            if int(batch["seq"]) == int(seq):
+                return batch
+        raise Conflict("第%s批复通批次不存在" % seq)
+
+    def _pre_failure_capacity(self, record: Dict[str, Any]) -> int:
+        return int(record["payload"]["capacity_gbps"])
+
+    def plan_register_batch(self, record: Dict[str, Any], batches: List[Dict[str, Any]], data: Dict[str, Any]) -> Dict[str, Any]:
+        data = data or {}
+        route = text(data, "route")
+        capacity = integer(data, "capacity_gbps", 1)
+        customer_groups = text_list(data, "customer_groups", 1)
+        if len(set(customer_groups)) != len(customer_groups):
+            raise ValidationError("同一批次内客户组不能重复")
+        total = self._pre_failure_capacity(record)
+        active = self._active_batches(batches)
+        registered = sum(int(batch["capacity_gbps"]) for batch in active)
+        if registered + capacity > total:
+            raise Conflict("累计容量不得超过故障前容量，剩余可登记容量%sGbps" % (total - registered))
+        if any(batch["route"] == route for batch in active):
+            raise Conflict("路由%s已被其他批次占用" % route)
+        occupied_groups = set()
+        for batch in active:
+            occupied_groups.update(batch["customer_groups"])
+        duplicated = sorted({group for group in customer_groups if group in occupied_groups})
+        if duplicated:
+            raise Conflict("客户组%s已被其他批次占用" % "、".join(duplicated))
+        seq = max([int(batch["seq"]) for batch in batches] + [0]) + 1
+        return {"seq": seq, "route": route, "capacity_gbps": capacity, "customer_groups": customer_groups, "status": BATCH_PENDING}
+
+    def plan_confirm_batch(self, batches: List[Dict[str, Any]], data: Dict[str, Any]) -> Dict[str, Any]:
+        seq = integer(data or {}, "seq", 1)
+        batch = self._find_batch(batches, seq)
+        if batch["status"] != BATCH_PENDING:
+            raise Conflict("第%s批当前为%s状态，不能确认" % (seq, batch["status"]))
+        return {"seq": seq}
+
+    def plan_revert_batch(self, batches: List[Dict[str, Any]], data: Dict[str, Any]) -> Dict[str, Any]:
+        seq = integer(data or {}, "seq", 1)
+        batch = self._find_batch(batches, seq)
+        if batch["status"] == BATCH_REVERTED:
+            raise Conflict("第%s批已经撤销" % seq)
+        return {"seq": seq, "previous_status": batch["status"]}
+
+    def check_restore_finish(self, record: Dict[str, Any], batches: List[Dict[str, Any]]) -> Dict[str, int]:
+        total = self._pre_failure_capacity(record)
+        active = self._active_batches(batches)
+        confirmed = sum(int(batch["capacity_gbps"]) for batch in active if batch["status"] == BATCH_CONFIRMED)
+        pending = [batch for batch in active if batch["status"] == BATCH_PENDING]
+        if pending:
+            raise Conflict("仍有%s批待确认，不能结束工单" % len(pending))
+        if confirmed < total:
+            raise Conflict("容量尚未补齐，剩余缺口%sGbps" % (total - confirmed))
+        return {"pre_failure_capacity_gbps": total, "confirmed_capacity_gbps": confirmed}
+
+    def build_restore_ledger(self, record: Dict[str, Any], batches: List[Dict[str, Any]]) -> Dict[str, Any]:
+        total = self._pre_failure_capacity(record)
+        active = self._active_batches(batches)
+        registered = sum(int(batch["capacity_gbps"]) for batch in active)
+        confirmed = sum(int(batch["capacity_gbps"]) for batch in active if batch["status"] == BATCH_CONFIRMED)
+        pending_count = sum(1 for batch in active if batch["status"] == BATCH_PENDING)
+        return {"pre_failure_capacity_gbps": total, "registered_capacity_gbps": registered, "confirmed_capacity_gbps": confirmed, "remaining_gap_gbps": max(0, total - confirmed), "pending_count": pending_count, "batches": batches}

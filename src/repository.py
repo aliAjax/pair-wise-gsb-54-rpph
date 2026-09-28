@@ -47,8 +47,26 @@ class Repository:
                     details TEXT NOT NULL,
                     created_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS restore_batches (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    record_id INTEGER NOT NULL REFERENCES records(id) ON DELETE CASCADE,
+                    seq INTEGER NOT NULL,
+                    route TEXT NOT NULL,
+                    capacity_gbps INTEGER NOT NULL,
+                    customer_groups TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    created_by TEXT NOT NULL,
+                    confirmed_by TEXT,
+                    reverted_by TEXT,
+                    created_at TEXT NOT NULL,
+                    confirmed_at TEXT,
+                    reverted_at TEXT
+                );
                 CREATE INDEX IF NOT EXISTS idx_records_state ON records(state);
                 CREATE INDEX IF NOT EXISTS idx_audit_record ON audit_events(record_id, id);
+                CREATE INDEX IF NOT EXISTS idx_batches_record ON restore_batches(record_id, seq);
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_batches_route_active
+                    ON restore_batches(record_id, route) WHERE status != 'reverted';
                 """
             )
 
@@ -125,6 +143,74 @@ class Repository:
                 "INSERT INTO audit_events(record_id,action,actor_id,version,details,created_at) VALUES(?,?,?,?,?,?)",
                 (record_id, action, actor_id, int(row["version"]), json.dumps(details, ensure_ascii=False, sort_keys=True), _now()),
             )
+
+    @staticmethod
+    def _batch_row(row: sqlite3.Row) -> Dict[str, Any]:
+        item = dict(row)
+        item.pop("record_id", None)
+        item.pop("id", None)
+        item["customer_groups"] = json.loads(item["customer_groups"])
+        return item
+
+    def list_restore_batches(self, record_id: int) -> List[Dict[str, Any]]:
+        self.get(record_id)
+        with self._connect() as connection:
+            rows = connection.execute("SELECT * FROM restore_batches WHERE record_id=? ORDER BY seq", (record_id,)).fetchall()
+        return [self._batch_row(row) for row in rows]
+
+    def insert_restore_batch(self, connection: sqlite3.Connection, record_id: int, batch: Dict[str, Any], actor_id: str, now: str) -> None:
+        connection.execute(
+            "INSERT INTO restore_batches(record_id,seq,route,capacity_gbps,customer_groups,status,created_by,created_at) VALUES(?,?,?,?,?,?,?,?)",
+            (record_id, batch["seq"], batch["route"], batch["capacity_gbps"], json.dumps(batch["customer_groups"], ensure_ascii=False), batch["status"], actor_id, now),
+        )
+
+    def mark_restore_batch(self, connection: sqlite3.Connection, record_id: int, seq: int, status: str, actor_id: str, now: str) -> None:
+        if status == "confirmed":
+            cursor = connection.execute(
+                "UPDATE restore_batches SET status='confirmed',confirmed_by=?,confirmed_at=? WHERE record_id=? AND seq=?",
+                (actor_id, now, record_id, seq),
+            )
+        else:
+            cursor = connection.execute(
+                "UPDATE restore_batches SET status='reverted',reverted_by=?,reverted_at=? WHERE record_id=? AND seq=?",
+                (actor_id, now, record_id, seq),
+            )
+        if cursor.rowcount != 1:
+            raise Conflict("第%s批复通批次不存在" % seq)
+
+    def mutate_ledger(self, record_id: int, expected_version: int, state: str, action: str, details: Dict[str, Any], ledger_op: Dict[str, Any], actor_id: str) -> Dict[str, Any]:
+        now = _now()
+        try:
+            with self._connect() as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                row = connection.execute("SELECT version FROM records WHERE id=?", (record_id,)).fetchone()
+                if row is None:
+                    connection.rollback()
+                    raise NotFound("记录不存在")
+                if int(row["version"]) != int(expected_version):
+                    connection.rollback()
+                    raise Conflict("版本冲突，请刷新后重试")
+                version = int(expected_version) + 1
+                connection.execute(
+                    "UPDATE records SET state=?,version=?,updated_by=?,updated_at=? WHERE id=?",
+                    (state, version, actor_id, now, record_id),
+                )
+                op_name = ledger_op["op"]
+                if op_name == "register":
+                    self.insert_restore_batch(connection, record_id, ledger_op["batch"], actor_id, now)
+                elif op_name == "confirm":
+                    self.mark_restore_batch(connection, record_id, ledger_op["seq"], "confirmed", actor_id, now)
+                elif op_name == "revert":
+                    self.mark_restore_batch(connection, record_id, ledger_op["seq"], "reverted", actor_id, now)
+                connection.execute(
+                    "INSERT INTO audit_events(record_id,action,actor_id,version,details,created_at) VALUES(?,?,?,?,?,?)",
+                    (record_id, action, actor_id, version, json.dumps(details, ensure_ascii=False, sort_keys=True), now),
+                )
+                result = connection.execute("SELECT * FROM records WHERE id=?", (record_id,)).fetchone()
+                connection.commit()
+        except sqlite3.IntegrityError as exc:
+            raise Conflict("路由已被其他批次占用") from exc
+        return self._row(result)
 
     def audit_timeline(self, record_id: int) -> List[Dict[str, Any]]:
         self.get(record_id)
