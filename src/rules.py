@@ -1,13 +1,14 @@
 """跨海光缆故障与抢修协调领域规则与状态转换。"""
-from typing import Any, Dict, Iterable, Tuple
+from typing import Any, Dict, Iterable, List, Tuple
 
-from .domain import Actor, Conflict, ValidationError, boolean, choice, integer, number, text, text_list
+from .domain import Actor, Conflict, NotFound, ValidationError, boolean, choice, integer, number, text, text_list
 
 
 INITIAL_STATE = "detected"
 CREATE_ROLES = {'noc_operator'}
-ACTION_ROLES = {'approve': {'repair_manager'}, 'mobilize': {'vessel_master'}, 'survey': {'cable_engineer'}, 'splice': {'cable_engineer'}, 'test': {'noc_operator'}, 'restore': {'noc_operator', 'repair_manager'}, 'cancel': {'repair_manager'}}
-TRANSITIONS = {'approve': {'detected': 'approved'}, 'mobilize': {'approved': 'mobilized'}, 'survey': {'mobilized': 'surveyed'}, 'splice': {'surveyed': 'spliced'}, 'test': {'spliced': 'tested'}, 'restore': {'tested': 'restored'}, 'cancel': {'detected': 'cancelled', 'approved': 'cancelled', 'mobilized': 'cancelled'}}
+ACTION_ROLES = {'approve': {'repair_manager'}, 'mobilize': {'vessel_master'}, 'survey': {'cable_engineer'}, 'splice': {'cable_engineer'}, 'test': {'noc_operator'}, 'register_batch': {'noc_operator', 'repair_manager'}, 'confirm_batch': {'noc_operator', 'repair_manager'}, 'revoke_batch': {'noc_operator', 'repair_manager'}, 'complete_restoration': {'noc_operator', 'repair_manager'}, 'cancel': {'repair_manager'}}
+TRANSITIONS = {'approve': {'detected': 'approved'}, 'mobilize': {'approved': 'mobilized'}, 'survey': {'mobilized': 'surveyed'}, 'splice': {'surveyed': 'spliced'}, 'test': {'spliced': 'tested'}, 'register_batch': {'tested': 'restoring', 'restoring': 'restoring'}, 'confirm_batch': {'restoring': 'restoring'}, 'revoke_batch': {'restoring': 'restoring'}, 'complete_restoration': {'restoring': 'restored'}, 'cancel': {'detected': 'cancelled', 'approved': 'cancelled', 'mobilized': 'cancelled'}}
+RESTORATION_ACTIONS = {'register_batch', 'confirm_batch', 'revoke_batch', 'complete_restoration'}
 
 
 class DomainRules:
@@ -106,14 +107,49 @@ class DomainRules:
             changes["end_to_end_loss_db"] = end_loss
             changes["test_passed"] = True
             summary = "系统测试通过"
-        elif action == "restore":
-            if not boolean(data, "traffic_restored"):
-                raise ValidationError("业务流量尚未恢复")
-            changes["traffic_restored"] = True
-            changes["restore_capacity_gbps"] = integer(data, "restore_capacity_gbps", 1)
-            summary = "通信恢复"
         elif action == "cancel":
             changes["cancel_reason"] = text(data, "cancel_reason")
             summary = "抢修取消"
         p.update(changes)
         return new_state, p, summary or ("已执行%s" % action)
+
+    def plan_restoration(self, record: Dict[str, Any], action: str, data: Dict[str, Any], batches: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """校验分批复通动作并返回台账变更计划（纯规则，不落库）。"""
+        new_state = self.require_transition(record, action)
+        data = dict(data or {})
+        capacity_total = int(record["payload"]["capacity_gbps"])
+        active = [item for item in batches if item["status"] in ("pending", "confirmed")]
+        if action == "register_batch":
+            route = text(data, "route")
+            capacity = integer(data, "capacity_gbps", 1)
+            groups = text_list(data, "customer_groups", 1)
+            if any(item["route"] == route for item in active):
+                raise Conflict("该路由已在其他复通批次中占用")
+            existing_groups = {group for item in active for group in item["customer_groups"]}
+            duplicated = sorted(set(groups) & existing_groups)
+            if duplicated:
+                raise Conflict("客户组%s已在其他复通批次中占用" % "、".join(duplicated))
+            reserved = sum(int(item["capacity_gbps"]) for item in active)
+            if reserved + capacity > capacity_total:
+                raise ValidationError("累计容量%s超过故障前容量%s" % (reserved + capacity, capacity_total))
+            batch_no = len(batches) + 1
+            return {"action": action, "state": new_state, "batch_no": batch_no, "batch": {"batch_no": batch_no, "route": route, "capacity_gbps": capacity, "customer_groups": groups}, "summary": "第%s批复通已登记，待确认" % batch_no}
+        if action == "complete_restoration":
+            pending = [item for item in active if item["status"] == "pending"]
+            confirmed_capacity = sum(int(item["capacity_gbps"]) for item in active if item["status"] == "confirmed")
+            if pending:
+                raise Conflict("仍有%s个待确认批次，不能结束工单" % len(pending))
+            if confirmed_capacity < capacity_total:
+                raise ValidationError("已确认容量%s未补齐故障前容量%s" % (confirmed_capacity, capacity_total))
+            return {"action": action, "state": new_state, "summary": "容量已补齐，分批复通完成"}
+        batch_no = integer(data, "batch_no", 1)
+        target = next((item for item in batches if item["batch_no"] == batch_no), None)
+        if target is None:
+            raise NotFound("复通批次不存在")
+        if action == "confirm_batch":
+            if target["status"] != "pending":
+                raise Conflict("第%s批不是待确认状态" % batch_no)
+            return {"action": action, "state": new_state, "batch_no": batch_no, "summary": "第%s批复通已确认，容量计入可用" % batch_no}
+        if target["status"] not in ("pending", "confirmed"):
+            raise Conflict("第%s批已撤销，不能重复撤销" % batch_no)
+        return {"action": action, "state": new_state, "batch_no": batch_no, "summary": "第%s批复通已撤销，仅回退该批容量与占用" % batch_no}

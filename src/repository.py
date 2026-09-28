@@ -2,7 +2,7 @@
 import json
 import sqlite3
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from .domain import Conflict, NotFound
 
@@ -47,8 +47,25 @@ class Repository:
                     details TEXT NOT NULL,
                     created_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS restoration_batches (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    record_id INTEGER NOT NULL REFERENCES records(id) ON DELETE CASCADE,
+                    batch_no INTEGER NOT NULL,
+                    route TEXT NOT NULL,
+                    capacity_gbps INTEGER NOT NULL,
+                    customer_groups TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    created_by TEXT NOT NULL,
+                    updated_by TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    confirmed_at TEXT,
+                    revoked_at TEXT,
+                    UNIQUE(record_id, batch_no)
+                );
                 CREATE INDEX IF NOT EXISTS idx_records_state ON records(state);
                 CREATE INDEX IF NOT EXISTS idx_audit_record ON audit_events(record_id, id);
+                CREATE INDEX IF NOT EXISTS idx_batches_record ON restoration_batches(record_id, batch_no);
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_batches_route_active ON restoration_batches(record_id, route) WHERE status IN ('pending','confirmed');
                 """
             )
 
@@ -115,6 +132,74 @@ class Repository:
             result = connection.execute("SELECT * FROM records WHERE id=?", (record_id,)).fetchone()
             connection.commit()
         return self._row(result)
+
+    @staticmethod
+    def _batch_row(row: sqlite3.Row) -> Dict[str, Any]:
+        item = dict(row)
+        item["customer_groups"] = json.loads(item["customer_groups"])
+        return item
+
+    def list_batches(self, record_id: int) -> List[Dict[str, Any]]:
+        with self._connect() as connection:
+            rows = connection.execute("SELECT * FROM restoration_batches WHERE record_id=? ORDER BY batch_no", (record_id,)).fetchall()
+        return [self._batch_row(row) for row in rows]
+
+    def apply_restoration(self, record_id: int, expected_version: int, plan: Dict[str, Any], payload: Dict[str, Any], actor_id: str, input_data: Dict[str, Any]) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
+        now = _now()
+        action = plan["action"]
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute("SELECT state, version FROM records WHERE id=?", (record_id,)).fetchone()
+            if row is None:
+                connection.rollback()
+                raise NotFound("记录不存在")
+            if int(row["version"]) != int(expected_version):
+                connection.rollback()
+                raise Conflict("版本冲突，请刷新后重试")
+            version = int(expected_version) + 1
+            state = plan["state"]
+            connection.execute(
+                "UPDATE records SET state=?,version=?,payload=?,updated_by=?,updated_at=? WHERE id=?",
+                (state, version, json.dumps(payload, ensure_ascii=False, sort_keys=True), actor_id, now, record_id),
+            )
+            batch_no = plan.get("batch_no")
+            if action == "register_batch":
+                batch = plan["batch"]
+                try:
+                    connection.execute(
+                        "INSERT INTO restoration_batches(record_id,batch_no,route,capacity_gbps,customer_groups,status,created_by,updated_by,created_at) VALUES(?,?,?,?,?,?,?,?,?)",
+                        (record_id, batch["batch_no"], batch["route"], batch["capacity_gbps"], json.dumps(batch["customer_groups"], ensure_ascii=False), "pending", actor_id, actor_id, now),
+                    )
+                except sqlite3.IntegrityError as exc:
+                    connection.rollback()
+                    raise Conflict("该路由已在其他复通批次中占用") from exc
+            elif action == "confirm_batch":
+                updated = connection.execute(
+                    "UPDATE restoration_batches SET status='confirmed',updated_by=?,confirmed_at=? WHERE record_id=? AND batch_no=? AND status='pending'",
+                    (actor_id, now, record_id, batch_no),
+                )
+                if updated.rowcount == 0:
+                    connection.rollback()
+                    raise Conflict("第%s批不是待确认状态" % batch_no)
+            elif action == "revoke_batch":
+                updated = connection.execute(
+                    "UPDATE restoration_batches SET status='revoked',updated_by=?,revoked_at=? WHERE record_id=? AND batch_no=? AND status IN ('pending','confirmed')",
+                    (actor_id, now, record_id, batch_no),
+                )
+                if updated.rowcount == 0:
+                    connection.rollback()
+                    raise Conflict("第%s批已撤销，不能重复撤销" % batch_no)
+            details = {"summary": plan["summary"], "input": input_data or {}, "from": row["state"], "to": state}
+            if batch_no is not None:
+                details["batch_no"] = batch_no
+            connection.execute(
+                "INSERT INTO audit_events(record_id,action,actor_id,version,details,created_at) VALUES(?,?,?,?,?,?)",
+                (record_id, action, actor_id, version, json.dumps(details, ensure_ascii=False, sort_keys=True), now),
+            )
+            result = connection.execute("SELECT * FROM records WHERE id=?", (record_id,)).fetchone()
+            batch_rows = connection.execute("SELECT * FROM restoration_batches WHERE record_id=? ORDER BY batch_no", (record_id,)).fetchall()
+            connection.commit()
+        return self._row(result), [self._batch_row(item) for item in batch_rows]
 
     def add_audit(self, record_id: int, actor_id: str, action: str, details: Dict[str, Any]) -> None:
         with self._connect() as connection:
